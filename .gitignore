@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OpenJev
+checkpoints/
+data/*.jsonl
+!data/train.jsonl
+!data/eval.jsonl
+!data/calibration.jsonl
