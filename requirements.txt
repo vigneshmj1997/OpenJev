@@ -1,7 +1,3 @@
-torch>=2.4.0
-transformers>=4.48.0
-tokenizers>=0.21.0
-numpy>=1.26.0
-# ModernBERT reaches full speed with Flash Attention 2 on Ampere+ GPUs.
-# Optional; the model runs without it via the SDPA fallback.
-# flash-attn>=2.6.3
+torch>=2.2
+transformers>=4.48
+pytest>=7

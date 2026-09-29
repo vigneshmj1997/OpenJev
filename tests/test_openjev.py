@@ -1,169 +1,214 @@
-"""Tests for the pieces that are easy to get subtly wrong.
+"""Offline tests: a tiny random BERT stands in for the real encoder."""
 
-Run: python -m pytest tests/ -v   (or: python tests/test_openjev.py)
-"""
+import json
+import math
+import os
 
-from __future__ import annotations
+import pytest
+import torch
+from transformers import BertConfig, BertModel, BertTokenizerFast
 
-import sys
-from pathlib import Path
+from openjev import OpenJev, OpenJevConfig, OpenJevModel, TrainArgs, train
+from openjev.calibration import evaluate_logits, expected_calibration_error, fit_temperature, fit_temperatures
+from openjev.config import base_config, find_checkpoint
+from openjev.data import CHOICE, MULTI, NOUL, NOUL_OPTIONS, Collator, Example, parse_record
+from openjev.model import openjev_loss, probabilities, soft_cross_entropy
+from openjev.train import model_inputs
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import torch  # noqa: E402
-
-from openjev.calibration import (  # noqa: E402
-    brier_score,
-    expected_calibration_error,
-    fit_temperature,
-)
-from openjev.data import _as_distribution  # noqa: E402
-from openjev.schema import Question, confidence_from, serialize_answer  # noqa: E402
-
-CHOICE = Question.from_dict(
-    {
-        "type": "choice",
-        "instructions": "Which team should handle this?",
-        "criteria": {
-            "billing": "Payments, invoicing, refunds",
-            "technical": "Bugs, outages, integrations",
-            "sales": "Pricing, upgrades, new accounts",
-        },
-    }
-)
-NOUL = Question.from_dict(
-    {
-        "type": "noul",
-        "instructions": "Does this convey urgency?",
-        "criteria": {"true": "Explicitly time-sensitive", "false": "No urgency expressed"},
-    }
-)
-SCORE = Question.from_dict(
-    {
-        "type": "score",
-        "instructions": "How frustrated is the customer?",
-        "criteria": ["Calm", "Frustrated", "Very angry"],
-    }
-)
+WORDS = "refund approve deny escalate order item broken late yes no maybe the a is to".split()
 
 
-def test_envelope_matches_documented_shape():
-    assert serialize_answer(NOUL, [0.95, 0.05]) == {"type": "noul", "noul": 0.95}
-
-    team = serialize_answer(CHOICE, [0.88, 0.12, 0.0])
-    assert team["choice"] == "billing"
-    assert team["probabilities"] == {"billing": 0.88, "technical": 0.12, "sales": 0.0}
-    assert set(team) == {"type", "choice", "probabilities", "confidence"}
-
-    anger = serialize_answer(SCORE, [0.0, 0.95, 0.05])
-    assert anger["score"] == 1.05  # 0*0.0 + 1*0.95 + 2*0.05
-    assert anger["legend"] == {"0": "Calm", "1": "Frustrated", "2": "Very angry"}
-
-
-def test_noul_omits_confidence():
-    """For a binary question the probability IS the certainty, so a separate
-    confidence field would be redundant."""
-    assert "confidence" not in serialize_answer(NOUL, [0.7, 0.3])
-    assert "probabilities" not in serialize_answer(NOUL, [0.7, 0.3])
-
-
-def test_response_keys_come_from_request():
-    """Every key in an answer must be traceable to the question that produced it."""
-    answer = serialize_answer(CHOICE, [0.5, 0.3, 0.2])
-    assert list(answer["probabilities"]) == list(CHOICE.criteria)
-    assert answer["choice"] in CHOICE.criteria
-
-
-def test_score_is_an_expectation_not_an_index():
-    """Ordered levels make a between-levels answer meaningful."""
-    assert serialize_answer(SCORE, [1.0, 0.0, 0.0])["score"] == 0.0
-    assert serialize_answer(SCORE, [0.0, 0.0, 1.0])["score"] == 2.0
-    assert serialize_answer(SCORE, [0.5, 0.0, 0.5])["score"] == 1.0
-    assert serialize_answer(SCORE, [0.0, 0.5, 0.5])["score"] == 1.5
-
-
-def test_confidence_bounds():
-    assert confidence_from([1.0, 0.0, 0.0]) == 1.0          # one-hot
-    assert confidence_from([1 / 3, 1 / 3, 1 / 3]) < 1e-9    # uniform
-    assert confidence_from([0.5, 0.25, 0.25]) > confidence_from([0.34, 0.33, 0.33])
-
-
-def test_confidence_distinguishes_spread():
-    """max(p) calls these equally confident (both 0.5). Entropy does not: the
-    two-way tie has definitively eliminated one option, while the thin spread
-    has ruled out nothing, so the tie is the more informative distribution."""
-    tie = confidence_from([0.5, 0.5, 0.0])
-    spread = confidence_from([0.5, 0.25, 0.25])
-    assert tie > spread
-
-
-def test_label_forms():
-    assert _as_distribution({"label": "technical"}, CHOICE) == [0.0, 1.0, 0.0]
-    assert _as_distribution({"label": True}, NOUL) == [1.0, 0.0]
-    assert _as_distribution({"label": 2}, SCORE) == [0.0, 0.0, 1.0]
-    assert _as_distribution({"target": [0.0, 0.95, 0.05]}, SCORE) == [0.0, 0.95, 0.05]
-    assert _as_distribution({"target": {"billing": 0.6, "technical": 0.4}}, CHOICE) == [0.6, 0.4, 0.0]
-    assert _as_distribution({"target": [1, 3]}, NOUL) == [0.25, 0.75]  # renormalized
-
-
-def test_noul_positive_class_is_index_zero():
-    """probs[0] is what gets reported as `noul`, so `true` must sort first."""
-    assert NOUL.keys[0] == "true"
-    assert _as_distribution({"label": True}, NOUL)[0] == 1.0
-
-
-def test_keys_align_with_descriptions():
-    for q in (CHOICE, NOUL, SCORE):
-        assert len(q.keys) == len(q.descriptions) == q.k
-
-
-def test_temperature_reduces_ece_without_moving_argmax():
+@pytest.fixture(scope="session")
+def tiny_encoder_dir(tmp_path_factory):
+    """A tiny random BERT + tokenizer saved like any Hugging Face encoder."""
+    directory = tmp_path_factory.mktemp("tiny-bert")
+    vocab = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + WORDS
+    vocab_file = directory / "vocab.txt"
+    vocab_file.write_text("\n".join(vocab))
+    tokenizer = BertTokenizerFast(vocab_file=str(vocab_file))
     torch.manual_seed(0)
-    n, k = 2000, 3
-    labels = torch.randint(0, k, (n,))
-    logits = torch.randn(n, k)
-    correct = torch.rand(n) < 0.70
-    logits[torch.arange(n), labels] += torch.where(correct, 4.0, -1.0)
-    logits *= 2.5  # make it overconfident
-
-    before = logits.softmax(-1)
-    temperature = fit_temperature(logits.clone(), labels)
-    after = (logits / temperature).softmax(-1)
-
-    assert temperature > 1.0
-    assert expected_calibration_error(after, labels) < expected_calibration_error(before, labels)
-    assert brier_score(after, labels) < brier_score(before, labels)
-    # Temperature scaling is monotone: it cannot change which option wins.
-    assert torch.equal(before.argmax(-1), after.argmax(-1))
+    encoder = BertModel(BertConfig(vocab_size=len(vocab), hidden_size=32, num_hidden_layers=2,
+                                   num_attention_heads=2, intermediate_size=64,
+                                   max_position_embeddings=64))
+    encoder.save_pretrained(directory)
+    tokenizer.save_pretrained(directory)
+    return str(directory)
 
 
-def test_ragged_k_masking():
-    """A k=2 noul and a k=3 choice must coexist in one batch without the noul
-    leaking probability mass into its unused slot."""
-    logits = torch.full((2, 3), float("-inf"))
-    logits[0, :3] = torch.tensor([1.0, 2.0, 0.5])
-    logits[1, :2] = torch.tensor([1.0, 1.0])
-    probs = logits.log_softmax(-1).exp()
-
-    assert probs[1, 2].item() == 0.0
-    assert abs(probs[0].sum().item() - 1.0) < 1e-6
-    assert abs(probs[1].sum().item() - 1.0) < 1e-6
-    assert abs(probs[1, 0].item() - 0.5) < 1e-6
+def make_model(encoder_dir):
+    config = OpenJevConfig(encoder=encoder_dir, max_length=32, dropout=0.0)
+    return OpenJevModel(config), BertTokenizerFast.from_pretrained(encoder_dir)
 
 
-def _run_all():
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS  {name}")
-        except AssertionError as exc:
-            failed += 1
-            print(f"  FAIL  {name}: {exc}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
-    return failed
+def test_parse_record_label_forms():
+    assert parse_record({"state": "c", "options": ["a", "b"], "label": 1}).target == [0.0, 1.0]
+    assert parse_record({"state": "c", "options": ["a", "b"], "label": "a"}).target == [1.0, 0.0]
+    assert parse_record({"state": "c", "options": ["a", "b"], "probs": [3, 1]}).target == [0.75, 0.25]
+    with pytest.raises(ValueError):
+        parse_record({"state": "c", "options": ["a", "b"], "label": "z"})
+    with pytest.raises(ValueError):
+        parse_record({"state": "c", "options": ["a"], "label": 0})
 
 
-if __name__ == "__main__":
-    sys.exit(1 if _run_all() else 0)
+def test_parse_record_noul_and_multi():
+    noul = parse_record({"type": "noul", "state": "c", "label": True})
+    assert noul.options == NOUL_OPTIONS and noul.target == [1.0, 0.0]
+    assert parse_record({"type": "noul", "state": "c", "label": "false"}).target == [0.0, 1.0]
+    assert parse_record({"type": "noul", "state": "c", "prob": 0.25}).target == [0.25, 0.75]
+
+    multi = parse_record({"type": "multi", "state": "c", "options": ["a", "b", "c"], "labels": ["a", 2]})
+    assert multi.target == [1.0, 0.0, 1.0]  # independent, not normalized
+    assert parse_record({"type": "multi", "state": "c", "options": ["a", "b"], "labels": []}).target == [0, 0]
+    assert parse_record({"type": "multi", "state": "c", "options": ["a"], "probs": [0.9]}).target == [0.9]
+    with pytest.raises(ValueError):
+        parse_record({"type": "multi", "state": "c", "options": ["a", "b"], "probs": [1.5, 0]})
+    with pytest.raises(ValueError):
+        parse_record({"type": "noul", "state": "c", "label": "maybe"})
+    with pytest.raises(ValueError):
+        parse_record({"type": "rank", "state": "c", "options": ["a", "b"], "label": 0})
+
+
+def test_ragged_options_padded_with_neg_inf(tiny_encoder_dir):
+    model, tokenizer = make_model(tiny_encoder_dir)
+    batch = Collator(tokenizer, 32)([
+        Example("refund order", ["approve", "deny"], [1.0, 0.0]),
+        Example("item broken", ["approve", "deny", "escalate", "maybe"], [0, 0, 1.0, 0]),
+    ])
+    logits = model(**model_inputs(batch))
+    assert logits.shape == (2, 4)
+    assert torch.isinf(logits[0, 2:]).all() and torch.isfinite(logits[0, :2]).all()
+    assert torch.isfinite(logits[1]).all()
+    loss = soft_cross_entropy(logits, batch["targets"])
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.head.weight.grad is not None
+
+
+def test_scores_do_not_depend_on_batch_neighbours(tiny_encoder_dir):
+    model, tokenizer = make_model(tiny_encoder_dir)
+    model.eval()
+    collate = Collator(tokenizer, 32)
+    ex = Example("refund order", ["approve", "deny"], [1.0, 0.0])
+    alone = model(**model_inputs(collate([ex])))
+    paired = model(**model_inputs(collate([ex, Example("late item", ["yes", "no", "maybe"], [1, 0, 0])])))
+    assert torch.allclose(alone[0], paired[0, :2], atol=1e-5)
+
+
+def test_mixed_types_in_one_batch(tiny_encoder_dir):
+    model, tokenizer = make_model(tiny_encoder_dir)
+    batch = Collator(tokenizer, 32)([
+        Example("item broken", NOUL_OPTIONS, [1.0, 0.0], "noul"),
+        Example("refund order", ["approve", "deny", "escalate"], [0, 1.0, 0], "choice"),
+        Example("late item broken", ["late", "broken", "the", "a"], [1.0, 1.0, 0, 0], "multi"),
+    ])
+    assert batch["kinds"].tolist() == [NOUL, CHOICE, MULTI]
+    logits = model(**model_inputs(batch))
+    assert logits.shape == (3, 4)
+
+    probs = probabilities(logits.detach(), batch["kinds"], model.temperature)
+    assert probs[0].sum() == pytest.approx(1.0) and (probs[0, 2:] == 0).all()
+    assert probs[1].sum() == pytest.approx(1.0) and probs[1, 3] == 0
+    assert torch.allclose(probs[2], torch.sigmoid(logits[2].detach()))  # independent, need not sum to 1
+
+    loss = openjev_loss(logits, batch["targets"], batch["kinds"])
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.head.weight.grad.abs().sum() > 0
+    assert model.multi_head.weight.grad.abs().sum() > 0
+
+
+def test_multi_head_scores_only_multi_rows(tiny_encoder_dir):
+    model, tokenizer = make_model(tiny_encoder_dir)
+    model.eval()
+    collate = Collator(tokenizer, 32)
+    as_choice = model(**model_inputs(collate([Example("refund", ["approve", "deny"], [1, 0], "choice")])))
+    as_multi = model(**model_inputs(collate([Example("refund", ["approve", "deny"], [1, 0], "multi")])))
+    with torch.no_grad():
+        model.multi_head.weight.zero_()
+        model.multi_head.bias.fill_(3.0)
+    assert torch.allclose(model(**model_inputs(collate([Example("refund", ["approve", "deny"], [1, 0], "multi")]))),
+                          torch.full((1, 2), 3.0))
+    assert not torch.allclose(as_choice, as_multi)
+
+
+def test_ece_and_temperature():
+    labels = torch.tensor([0, 1, 0, 1])
+    perfect = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+    assert expected_calibration_error(perfect, labels) == pytest.approx(0.0)
+
+    # Overconfident logits: true temperature is 3, fitting should recover it.
+    torch.manual_seed(0)
+    true_logits = torch.randn(4000, 3)
+    targets = torch.nn.functional.one_hot(torch.distributions.Categorical(logits=true_logits).sample(), 3).float()
+    t = fit_temperature(true_logits * 3, targets)
+    assert t == pytest.approx(3.0, rel=0.15)
+    fitted = evaluate_logits(true_logits * 3, targets, temperatures=(1.0, t, 1.0))
+    assert fitted["ece"] < evaluate_logits(true_logits * 3, targets)["ece"]
+    assert fitted["choice_temperature"] == t
+
+
+def test_multi_temperature_is_fitted_separately():
+    # Overconfident multi logits (true T = 2.5) next to already-calibrated choice logits.
+    torch.manual_seed(0)
+    multi_logits = torch.randn(3000, 3)
+    multi_targets = torch.bernoulli(torch.sigmoid(multi_logits))
+    choice_logits = torch.randn(3000, 3)
+    choice_targets = torch.nn.functional.one_hot(
+        torch.distributions.Categorical(logits=choice_logits).sample(), 3).float()
+    logits = torch.cat([multi_logits * 2.5, choice_logits])
+    targets = torch.cat([multi_targets, choice_targets])
+    kinds = torch.tensor([MULTI] * 3000 + [CHOICE] * 3000)
+
+    temps = fit_temperatures(logits, targets, kinds)
+    assert temps[MULTI] == pytest.approx(2.5, rel=0.15)
+    assert temps[CHOICE] == pytest.approx(1.0, rel=0.15)
+    assert temps[NOUL] == 1.0  # absent type is left alone
+    metrics = evaluate_logits(logits, targets, kinds, temps)
+    assert metrics["multi_ece"] < evaluate_logits(logits, targets, kinds)["multi_ece"]
+    assert "noul_ece" not in metrics
+
+
+def test_presets_and_default():
+    assert base_config("openjev").encoder == "answerdotai/ModernBERT-base"
+    assert base_config("openjev-mini").encoder == "google/bert_uncased_L-4_H-256_A-4"
+    assert base_config("some/encoder", max_length=128).max_length == 128
+    assert find_checkpoint("definitely/not-a-checkpoint") is None
+
+
+def test_end_to_end_train_save_load_predict(tiny_encoder_dir, tmp_path):
+    rows = []
+    for i in range(30):
+        yes = i % 2 == 0
+        state = "item broken refund" if yes else "the order is late"
+        rows.append({"state": state, "options": ["approve", "deny"], "label": 0 if yes else 1})
+        rows.append({"type": "noul", "state": state, "label": yes})
+        rows.append({"type": "multi", "state": state, "options": ["broken", "late", "maybe"],
+                     "labels": ["broken"] if yes else ["late"]})
+    train_file = tmp_path / "train.jsonl"
+    train_file.write_text("\n".join(json.dumps(r) for r in rows))
+    out = tmp_path / "ckpt"
+
+    summary = train(TrainArgs(train_file=str(train_file), model=tiny_encoder_dir, output_dir=str(out),
+                              epochs=2, batch_size=4, learning_rate=1e-3, max_length=32,
+                              device="cpu", log_every=1000))
+    assert len(summary["history"]) == 2
+    assert os.path.isfile(out / "openjev_config.json")
+    assert (out / "training_summary.json").exists()
+
+    jev = OpenJev.load(str(out), device="cpu")
+    for i, kind in enumerate(("noul", "choice", "multi")):
+        assert jev.model.temperature[i].item() == pytest.approx(summary["best"][f"{kind}_temperature"])
+
+    probs = jev.predict("item broken refund", ["approve", "deny", "escalate"])
+    assert set(probs) == {"approve", "deny", "escalate"}
+    assert math.isclose(sum(probs.values()), 1.0, rel_tol=1e-5)
+
+    noul = jev.noul("item broken refund")
+    assert noul["type"] == "noul" and 0.0 <= noul["noul"] <= 1.0
+
+    choice = jev.choice("item broken refund", ["approve", "deny"])
+    assert choice["choice"] in ("approve", "deny") and 0.0 <= choice["confidence"] <= 1.0
+
+    multi = jev.multi("item broken refund", ["broken", "late", "maybe"], threshold=0.0)
+    assert multi["selected"] == ["broken", "late", "maybe"]  # threshold 0 selects everything
+    assert set(multi["probabilities"]) == {"broken", "late", "maybe"}

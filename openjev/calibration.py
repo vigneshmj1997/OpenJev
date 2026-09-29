@@ -1,99 +1,100 @@
-"""Calibration metrics and temperature fitting.
-
-A fine-tuned classifier produces a well-shaped softmax that is systematically
-overconfident. Since the whole product here is the probability — not the argmax —
-calibration is the metric that matters, and accuracy alone will hide the problem.
-"""
+"""Temperature scaling and calibration metrics, per question type."""
 
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn.functional as F
+
+from .data import MULTI, TYPES
+from .model import openjev_loss, probabilities
 
 
-def expected_calibration_error(
-    probs: torch.Tensor,     # (n, k)
-    labels: torch.Tensor,    # (n,)
-    n_bins: int = 15,
-) -> float:
-    """ECE: average |confidence - accuracy| over equal-width confidence bins.
+@torch.no_grad()
+def fit_temperature(logits: torch.Tensor, targets: torch.Tensor, kinds: torch.Tensor | None = None,
+                    t_min: float = 0.05, t_max: float = 20.0, steps: int = 400) -> float:
+    """Temperature minimising NLL on held-out logits.
 
-    If the model says 0.9 on a bucket of inputs, ~90% of them should be right.
-    ECE measures how far off that promise is.
+    A dense grid search in log space, not a gradient optimiser: it is a single
+    scalar, and LBFGS line search divides by zero when the NLL is flat (e.g.
+    near-identical logits early in training).
     """
-    confidences, predictions = probs.max(dim=-1)
-    correct = predictions.eq(labels).float()
-
-    ece = torch.zeros(1, device=probs.device)
-    boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
-    for lo, hi in zip(boundaries[:-1], boundaries[1:]):
-        in_bin = (confidences > lo) & (confidences <= hi)
-        share = in_bin.float().mean()
-        if share.item() > 0:
-            ece += (correct[in_bin].mean() - confidences[in_bin].mean()).abs() * share
-    return ece.item()
+    logits, targets = logits.float(), targets.float()
+    grid = torch.logspace(torch.log10(torch.tensor(t_min)), torch.log10(torch.tensor(t_max)), steps)
+    losses = torch.stack([openjev_loss(logits / t, targets, kinds) for t in grid])
+    # Ties (flat NLL) resolve to the temperature closest to 1, i.e. leave logits alone.
+    best = losses.min()
+    near_best = torch.nonzero(losses <= best + 1e-6).squeeze(-1)
+    pick = near_best[(grid[near_best].log()).abs().argmin()]
+    return float(grid[pick])
 
 
-def brier_score(probs: torch.Tensor, labels: torch.Tensor) -> float:
-    """Mean squared error against the one-hot target. Proper scoring rule:
-    it is minimized only by reporting your true beliefs, so unlike accuracy it
-    cannot be gamed by confident guessing."""
-    onehot = F.one_hot(labels, num_classes=probs.size(-1)).float()
-    return ((probs - onehot) ** 2).sum(dim=-1).mean().item()
+def fit_temperatures(logits: torch.Tensor, targets: torch.Tensor, kinds: torch.Tensor) -> list[float]:
+    """One temperature per question type, indexed like TYPES. Absent types get 1.0."""
+    temperatures = []
+    for i in range(len(TYPES)):
+        rows = kinds == i
+        temperatures.append(fit_temperature(logits[rows], targets[rows], kinds[rows]) if rows.any() else 1.0)
+    return temperatures
 
 
-def reliability_table(
-    probs: torch.Tensor,
-    labels: torch.Tensor,
-    n_bins: int = 10,
-) -> list[dict[str, float]]:
-    """Per-bin confidence vs. accuracy — the numbers behind a reliability diagram."""
-    confidences, predictions = probs.max(dim=-1)
-    correct = predictions.eq(labels).float()
-    rows = []
-    boundaries = torch.linspace(0, 1, n_bins + 1)
-    for lo, hi in zip(boundaries[:-1], boundaries[1:]):
-        in_bin = (confidences > lo) & (confidences <= hi)
-        count = int(in_bin.sum().item())
-        rows.append(
-            {
-                "bin_low": round(lo.item(), 3),
-                "bin_high": round(hi.item(), 3),
-                "count": count,
-                "confidence": round(confidences[in_bin].mean().item(), 4) if count else 0.0,
-                "accuracy": round(correct[in_bin].mean().item(), 4) if count else 0.0,
-            }
-        )
-    return rows
+def expected_calibration_error(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """Top-label ECE: |confidence - accuracy| averaged over confidence bins."""
+    confidence, predicted = probs.max(-1)
+    correct = (predicted == labels).float()
+    return _binned_gap(confidence, correct, n_bins)
 
 
-def fit_temperature(
-    logits: torch.Tensor,    # (n, k), padded slots must be -inf
-    labels: torch.Tensor,    # (n,)
-    max_iter: int = 200,
-    lr: float = 0.01,
-) -> float:
-    """Fit a single scalar T minimizing NLL on held-out data.
+def binary_calibration_error(probs: torch.Tensor, outcomes: torch.Tensor, n_bins: int = 15) -> float:
+    """ECE for independent yes/no probabilities: |mean P - observed rate| per bin."""
+    return _binned_gap(probs, outcomes.float(), n_bins)
 
-    One parameter, so it needs very little data (a few hundred rows is plenty)
-    and cannot change the argmax — it only rescales confidence. Always fit on a
-    split the model did not train on, or you will "calibrate" against memorized
-    answers and make things worse.
+
+def _binned_gap(predicted: torch.Tensor, observed: torch.Tensor, n_bins: int) -> float:
+    edges = torch.linspace(0, 1, n_bins + 1)
+    edges[0] = -1e-9  # so P = 0 lands in the first bin
+    ece = torch.zeros(())
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        in_bin = (predicted > lo) & (predicted <= hi)
+        if in_bin.any():
+            weight = in_bin.float().mean()
+            ece += weight * (predicted[in_bin].mean() - observed[in_bin].mean()).abs()
+    return float(ece)
+
+
+def evaluate_logits(logits: torch.Tensor, targets: torch.Tensor, kinds: torch.Tensor | None = None,
+                    temperatures=None) -> dict:
+    """Metrics per question type present, plus example-weighted overall `accuracy` and `ece`.
+
+    noul/choice/score: argmax accuracy and top-label ECE.
+    multi: per-option accuracy at P >= 0.5 and binary ECE over every option.
     """
-    log_t = torch.zeros(1, requires_grad=True, device=logits.device)
-    optimizer = torch.optim.LBFGS([log_t], lr=lr, max_iter=max_iter)
+    logits, targets = logits.float(), targets.float()
+    if kinds is None:
+        kinds = torch.full((logits.shape[0],), TYPES.index("choice"))
+    if temperatures is None:
+        temperatures = [1.0] * len(TYPES)
+    temperature = torch.as_tensor(temperatures, dtype=torch.float32)
+    probs = probabilities(logits, kinds, temperature)
+    scaled = logits / temperature[kinds].unsqueeze(-1)
 
-    def closure() -> torch.Tensor:
-        optimizer.zero_grad()
-        scaled = logits / log_t.exp()
-        loss = F.cross_entropy(scaled, labels)
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-    temperature = log_t.exp().item()
-    if not math.isfinite(temperature) or temperature <= 0:
-        return 1.0
-    return temperature
+    metrics = {"nll": float(openjev_loss(scaled, targets, kinds))}
+    total = {"accuracy": 0.0, "ece": 0.0}
+    for i, kind in enumerate(TYPES):
+        rows = kinds == i
+        if not rows.any():
+            continue
+        p, t = probs[rows], targets[rows]
+        if i == MULTI:
+            real = torch.isfinite(logits[rows])
+            p, t = p[real], t[real]
+            accuracy = float(((p >= 0.5) == (t >= 0.5)).float().mean())
+            ece = binary_calibration_error(p, t)
+        else:
+            labels = t.argmax(-1)
+            accuracy = float((p.argmax(-1) == labels).float().mean())
+            ece = expected_calibration_error(p, labels)
+        share = float(rows.float().mean())
+        total["accuracy"] += share * accuracy
+        total["ece"] += share * ece
+        metrics.update({f"{kind}_accuracy": accuracy, f"{kind}_ece": ece,
+                        f"{kind}_temperature": float(temperature[i])})
+    return {**total, **metrics}

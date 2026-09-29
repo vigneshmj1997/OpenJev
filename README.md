@@ -1,181 +1,244 @@
 # OpenJev
 
-Open source version of Jev — an encoder-only, non-autoregressive decision model
-that returns typed, calibrated probabilities instead of text.
+An encoder-only decision model. You give it some state and a question. It
+returns calibrated probabilities. There is no text generation, so it cannot
+hallucinate an answer that isn't one of your options.
 
-Base model: [`answerdotai/ModernBERT-large`](https://huggingface.co/answerdotai/ModernBERT-large).
+There are four question types:
 
-## Why this base model
-
-Most public Jev reproductions bolt a scalar head onto a decoder (Qwen) and strip
-the autoregressive loop. That inherits the causal mask, so state tokens cannot
-attend to the question that comes after them — the model has to integrate at the
-very end. A decision task wants the opposite.
-
-ModernBERT is the encoder that makes the bidirectional version practical:
-
-| | context | bidirectional | positions | attention |
-|---|---|---|---|---|
-| BERT-large | 512 | yes | learned absolute | vanilla O(n²) |
-| DeBERTa-v3-large | 512 | yes | relative | disentangled |
-| Qwen + head | long | **no** (causal) | RoPE | Flash |
-| **ModernBERT-large** | **8192** | **yes** | **RoPE** | **Flash + local/global** |
-
-DeBERTa-v3 edges it on GLUE but caps at 512 tokens, which rules it out for a
-long-state decision model. ModernBERT is the only option with long context *and*
-a modern attention stack *and* no causal mask.
-
-## Architecture
-
-The head is inverted relative to a standard BERT classifier. Rather than a
-`Linear(hidden, k)` with `k` frozen at training time, options arrive as text and
-a single `Linear(hidden, 1)` scores each one:
-
-```
-[CLS] state [SEP] instructions [OPT] option_i  ->  encoder  ->  pool  ->  s_i
-```
-
-The `k` scores are stacked and softmaxed. `k` appears only in how many rows get
-stacked, never in a weight shape — so the label set can change per request, which
-a fixed classification head cannot do.
-
-Questions in one call are scored against the same state and in isolation from
-each other; a batch can mix a `k=2` noul with a `k=17` choice, because unused
-slots in the scatter grid are held at `-inf` and softmax ignores them.
-
-## Install
-
-```bash
-pip install -r requirements.txt
-```
-
-## Data format
-
-One JSONL line per (state, question, label):
-
-```json
-{"state": "Help! My payouts have been failing for 3 days.",
- "question": {"type": "choice",
-              "instructions": "Which team should handle this?",
-              "criteria": {"billing": "Payments, invoicing, refunds",
-                           "technical": "Bugs, outages, integrations",
-                           "sales": "Pricing, upgrades, new accounts"}},
- "label": "billing"}
-```
-
-`criteria` **descriptions** are the text encoded beside the state; `criteria`
-**keys** are labels zipped back on at serialization. Renaming a key cannot change
-the numbers; rewriting its description will.
-
-Labels accept several forms: a key string, `true`/`false` for noul, a level index
-for score, or `"target"` with an explicit soft distribution
-(`{"billing": 0.6, "technical": 0.4}`). Soft targets let a label carry real
-uncertainty instead of forcing a one-hot the model must be overconfident to fit.
-
-## Train
-
-```bash
-python scripts/train.py --config configs/modernbert_large.json
-python scripts/train.py --config configs/modernbert_base.json --epochs 1
-```
-
-Two stages, in order:
-
-1. **Fit** the encoder + scalar head on a soft-target cross-entropy. Two
-   parameter groups — the pretrained encoder moves at `2e-5`, the fresh head at
-   `1e-4`.
-2. **Calibrate** a single scalar temperature on a held-out split, everything else
-   frozen.
-
-Stage 2 is not optional. What comes out of stage 1 ranks well and is
-systematically overconfident; the temperature is what makes the reported
-probability usable as a routing signal. It has one parameter, so a few hundred
-held-out rows suffice — and because it is monotone it **cannot change the
-argmax**, only the confidence. Fit it on data the model never trained on, or you
-will calibrate against memorized answers.
-
-Checkpoints land in `output_dir/{best,final}`, alongside `history.json`,
-`summary.json`, and `reliability.json` (per-bin confidence vs. accuracy).
-
-## Infer
+| Type | Asks | Returns |
+|---|---|---|
+| `noul` | Is the statement in the state true? | P(true) |
+| `choice` | Which **one** of these options? | a distribution over the options (sums to 1) |
+| `multi` | Which of these options apply (any number)? | an independent P for each option |
+| `score` | Where does it fall on this low-to-high scale (2 to 10 levels)? | a distribution over the levels and the expected level |
 
 ```python
 from openjev import OpenJev
 
-jev = OpenJev("checkpoints/openjev-large/final")
-jev.decide(
-    state="Help! My payouts have been failing for 3 days.",
-    questions={
-        "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?",
-                      "criteria": {"true": "Explicitly time-sensitive",
-                                   "false": "No urgency expressed"}},
-        "team": {"type": "choice", "instructions": "Which team should handle this?",
-                 "criteria": {"billing": "Payments, invoicing, refunds",
-                              "technical": "Bugs, outages, integrations",
-                              "sales": "Pricing, upgrades, new accounts"}},
-        "anger": {"type": "score", "instructions": "How frustrated is the customer?",
-                  "criteria": ["Calm", "Frustrated", "Very angry"]},
-    },
-)
+jev = OpenJev.load()  # default model: "openjev"
+
+jev.noul("Tracking says the package was delivered, but the customer has a photo of an empty porch.")
+# {"type": "noul", "noul": 0.71}
+
+jev.choice("Package never arrived, tracking says lost",
+           ["approve refund", "deny refund", "escalate to human"])
+# {"type": "choice", "choice": "approve refund",
+#  "probabilities": {"approve refund": 0.79, "deny refund": 0.15, "escalate to human": 0.06},
+#  "confidence": 0.37}
+
+jev.multi("Arrived two weeks late and the box was crushed",
+          ["late", "damaged", "wrong item"])
+# {"type": "multi", "selected": ["late", "damaged"],
+#  "probabilities": {"late": 0.94, "damaged": 0.88, "wrong item": 0.03}}
+
+jev.score("Help! My payouts have been failing for 3 days.",
+          ["Calm", "Frustrated", "Very angry"], instructions="How frustrated is the customer?")
+# {"type": "score", "score": 1.05, "legend": {"0": "Calm", "1": "Frustrated", "2": "Very angry"},
+#  "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05}, "confidence": 0.82}
 ```
 
-Returns the Jev envelope:
+Every shorthand also takes `instructions` (the question to ask), and `choice`
+and `multi` accept `{option: description}` in place of a list.
+`jev.predict(state, options)` is kept as a shorthand for the choice
+probabilities.
+
+### Jev request format
+
+`jev.run(request)` answers one `state` against several named questions in one
+batch, in the same shape as the Jev API:
+
+```python
+jev.run({
+    "state": "Help! My payouts have been failing for 3 days.",
+    "model": "jev-latest",
+    "questions": {
+        "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"},
+        "department": {"type": "choice", "instructions": "Which team should handle this?",
+                       "criteria": {"billing": "Payments, invoicing, refunds",
+                                    "technical": "Bugs, outages, integrations"}},
+    },
+})
+# {"model": "openjev", "answers": {"is_urgent": {...}, "department": {...}},
+#  "usage": {"input_tokens": 118, "output_tokens": 0}, "elapsed": 31}
+```
+
+[docs/examples.md](docs/examples.md) has an example of every question type with
+its output.
+
+### Hugging Face pipeline
+
+`OpenJevPipeline` is a `transformers.Pipeline`, so it works like any other
+Hugging Face pipeline: pass one input or many, and it handles batching and the
+device for you. Each input is one question with its own `state`, in the same
+format as a line of training data (see [Data](#data)).
+
+```python
+from openjev import OpenJev, OpenJevPipeline
+
+jev = OpenJev.load()  # or a trained checkpoint: OpenJev.load("checkpoints/my-run")
+pipe = OpenJevPipeline(model=jev.model, tokenizer=jev.tokenizer, device=jev.device)
+
+# One question in, one answer out.
+pipe({"type": "noul", "state": "Help! My payouts have been failing for 3 days.",
+      "instructions": "Does this convey urgency?"})
+# {"type": "noul", "noul": 0.95}
+
+# A list in, a list out, batched.
+pipe([
+    {"type": "choice", "state": "Card was charged twice", "instructions": "Which team should handle this?",
+     "criteria": {"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations"}},
+    {"type": "score", "state": "Card was charged twice", "instructions": "How frustrated is the customer?",
+     "criteria": ["Calm", "Frustrated", "Very angry"]},
+], batch_size=16)
+```
+
+A generator is streamed: answers come back one at a time as each batch
+finishes, and the input is never loaded into memory all at once. This suits
+large files:
+
+```python
+import json
+
+def read_jsonl(path):
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+for result in pipe(read_jsonl("data/eval.jsonl"), batch_size=16):
+    print(result)
+```
+
+| Argument | Where | What it does |
+|---|---|---|
+| `device` | constructor | `"cpu"`, `"cuda"`, `"mps"` or a `torch.device` |
+| `batch_size` | constructor or call | questions per forward pass (default 1) |
+| `threshold` | constructor or call | `multi`: select options with P >= this (default 0.5) |
+
+Values given in the call override the constructor's. `pipe.save_pretrained(dir)`
+writes a normal OpenJev checkpoint, which `OpenJev.load(dir)` or
+`OpenJevModel.from_pretrained(dir)` can load again.
+
+Use `jev.run` for a full request with several named questions; the pipeline
+answers questions one by one.
+
+`transformers.pipeline("openjev", ...)` does **not** work yet. That factory only
+loads models stored in Hugging Face's own model and config format, and
+`OpenJevModel` is a plain PyTorch module. Create `OpenJevPipeline` directly as
+shown above.
+
+## How it works
+
+- Each `(state, option)` pair goes through a bidirectional encoder. A
+  `Linear(hidden, 1)` head turns each pair into one score. The heads never see
+  the number of options, so options can differ on every request.
+- **choice:** the scores for one example are softmaxed together.
+- **noul:** a two-option choice between the fixed descriptions
+  "Yes, this is true." and "No, this is not true.", or between the `true` and
+  `false` criteria when a question gives them.
+- **score:** a choice over the levels, each read as "Level i of n: ...". The
+  answer's `score` is the expected level index (0 = lowest), so it can fall
+  between levels.
+- `instructions` go in front of every option, and `criteria` descriptions after
+  its name, so the encoder reads `state` against `instructions + option: description`.
+  Objects and arrays in `state` or `instructions` are encoded as JSON.
+- **multi:** a separate `Linear(hidden, 1)` head, with a sigmoid on each score.
+  It needs its own head because a softmax ignores a constant shift, so the
+  choice head never learns an absolute level, and a sigmoid needs one.
+- **Stage 1:** train with soft cross-entropy (noul, choice, score) and binary
+  cross-entropy per option (multi). The types can be mixed in one file and one
+  batch.
+- **Stage 2:** after every epoch, fit one temperature per type on a
+  calibration split. Then measure ECE on the eval split. The checkpoint with
+  the **lowest ECE** is kept, because the product is the probability, not the
+  argmax.
+
+## Models
+
+`--model` accepts any of the following:
+
+| Value | What it loads |
+|---|---|
+| `openjev` *(default)* | `answerdotai/ModernBERT-base`: 8k context, RoPE |
+| `openjev-mini` | Google BERT-mini (`google/bert_uncased_L-4_H-256_A-4`, ~11M params) |
+| `openjev-large` | `answerdotai/ModernBERT-large` |
+| any HF encoder id | e.g. `microsoft/deberta-v3-base`, `bert-base-uncased` |
+| a directory | a trained OpenJev checkpoint |
+
+A preset name automatically uses `checkpoints/<name>` once you have trained it.
+
+## Data
+
+JSONL, one question per line. `type` is `noul`, `choice`, `multi` or `score`
+and defaults to `choice`. Labels can be indices or option text. Any line can
+also carry `instructions` and `criteria` as in the Jev request format.
 
 ```json
-{
-  "model": "openjev-final",
-  "answers": {
-    "is_urgent": {"type": "noul", "noul": 0.95},
-    "team": {"type": "choice", "choice": "billing",
-             "probabilities": {"billing": 0.88, "technical": 0.12, "sales": 0.0},
-             "confidence": 0.81},
-    "anger": {"type": "score", "score": 1.05,
-              "legend": {"0": "Calm", "1": "Frustrated", "2": "Very angry"},
-              "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05},
-              "confidence": 0.92}
-  },
-  "usage": {"input_tokens": 296, "output_tokens": 0}
-}
+{"state": "Item arrived broken", "options": ["approve refund", "deny refund"], "label": "approve refund"}
+{"state": "Arrived late but intact", "options": ["approve", "deny", "escalate"], "probs": [0.5, 0.2, 0.3]}
+{"type": "noul", "state": "Claim: the item arrived broken. Photo shows a cracked screen.", "label": true}
+{"type": "noul", "state": "...", "prob": 0.8}
+{"type": "multi", "state": "Late and crushed", "options": ["late", "damaged", "wrong item"], "labels": ["late", "damaged"]}
+{"type": "multi", "state": "...", "options": ["late", "damaged"], "probs": [0.9, 0.4]}
+{"type": "score", "state": "Help! Payouts failing for 3 days.", "instructions": "How frustrated is the customer?", "criteria": ["Calm", "Frustrated", "Very angry"], "label": "Frustrated"}
+{"type": "choice", "state": "...", "instructions": "Which team?", "criteria": {"billing": "Payments, refunds", "technical": "Bugs, outages"}, "label": "billing"}
 ```
 
-Every key in the response is copied from the request; the model supplies only the
-leaf floats. That is where "cannot produce type errors" comes from — it is
-structural, not a training achievement. Note it is *not* a correctness guarantee:
-the model can be confidently wrong, it just cannot be malformed.
+- **choice** `probs` are normalized to sum to 1.
+- **noul** has no `options`. Put the statement to judge in the state.
+- **multi** `labels` may be empty (nothing applies), and its `probs` are
+  independent, each in [0, 1].
+- **score** `criteria` lists 2 to 10 levels, low to high. Its `label` is a level
+  index or level text, or give `probs` over the levels.
 
-### Answer shapes
+`data/` holds a toy dataset with 11 decision categories: refunds, loans, content
+moderation, IT ticket routing, insurance claims, nurse-line triage, hiring,
+email triage, flight disruption, card fraud and review sentiment. Each category
+has its own rules, its own options (2 to 5) and its own facts. The state holds
+only the facts of the situation, with no instructions, rules or question. The
+model learns each category's rules from the labelled examples. Labels are
+balanced within each category.
+Regenerate or resize it with:
 
-- **noul** — bare probability, no `probabilities` map and no `confidence`: for a
-  binary question the probability *is* the certainty (0.5 is maximal uncertainty).
-- **choice** — `probabilities` over your criteria keys; `choice` is `argmax` used
-  to index your own key list.
-- **score** — `score` is the probability-weighted expectation `Σ i·pᵢ`, so `1.05`
-  legitimately falls between levels 1 and 2. This is meaningful only because
-  levels are *ordered*; there is no sensible average of `billing` and `sales`,
-  which is why choice has no equivalent field.
+```bash
+python scripts/make_toy_data.py --train 5000 --eval 500
+python scripts/make_toy_data.py --domains loan fraud insurance   # only some categories
+python scripts/make_toy_data.py --include-rules                   # also put the rules in the state
+```
 
-## Metrics
+## Train
 
-Accuracy alone will hide the failure that matters here, since the product is the
-probability rather than the argmax. Training reports:
+```bash
+pip install -r requirements.txt
+python scripts/train.py --config configs/openjev.json           # default model
+python scripts/train.py --config configs/openjev_mini.json      # small model, fine on CPU
+python scripts/train.py --train-file my.jsonl --model microsoft/deberta-v3-base
+```
 
-- **ECE** — average gap between stated confidence and observed accuracy.
-- **Brier** — proper scoring rule; minimized only by reporting true beliefs, so
-  unlike accuracy it cannot be gamed by confident guessing.
-- **reliability.json** — per-bin confidence vs. accuracy.
+- Command-line flags override values from `--config`. Run
+  `python scripts/train.py -h` to see every option.
+- If `--eval-file` or `--calibration-file` is missing, that split is carved
+  from the training data (`--heldout-fraction`, default 0.1).
+- The best checkpoint and `training_summary.json` are written to
+  `checkpoints/<model>`.
 
-Checkpoint selection uses ECE, not accuracy.
+## Predict
+
+```bash
+python scripts/predict.py --state "Customer wants a refund" --options approve deny escalate
+python scripts/predict.py --type noul --state "The item arrived broken."
+python scripts/predict.py --type multi --state "Late and crushed" --options late damaged "wrong item"
+python scripts/predict.py --type score --state "Help! Payouts failing for 3 days." \
+    --instructions "How frustrated is the customer?" --options Calm Frustrated "Very angry"
+python scripts/predict.py --model openjev-mini --input data/eval.jsonl   # uses each line's "type"
+python scripts/predict.py --request request.json                         # a full Jev request
+```
 
 ## Test
 
 ```bash
-python tests/test_openjev.py      # or: python -m pytest tests/ -v
+python -m pytest tests
 ```
 
-## Notes on fidelity
-
-TypeSafe has not disclosed Jev's architecture — no parameter count, no context
-window, no confirmation it is encoder-only. The encoder reading here follows the
-credible outside assessment rather than a published spec. `RLCD` in particular is
-a named-but-undocumented method; the temperature-scaling stage here is a
-well-understood stand-in for its calibration goal, not a reproduction of it.
+The tests use a tiny random BERT, so they run offline in a few seconds.

@@ -1,140 +1,169 @@
-"""OpenJev: a ModernBERT cross-encoder with an open-label scalar decision head.
+"""OpenJev: an encoder that scores each (state, option) pair.
 
-The head is inverted relative to a standard BERT classifier. Rather than a
-`Linear(hidden, k)` with k frozen at training time, options arrive as text in the
-input and a single `Linear(hidden, 1)` scores each one:
+The head is `Linear(hidden, 1)` applied per option, not `Linear(hidden, k)`,
+so the number and wording of options can change on every request. Scores for
+one example are gathered into a row padded with -inf. What happens to a row
+depends on its question type:
 
-    [CLS] state [SEP] instructions [SEP] option_i  ->  encoder  ->  pool  ->  s_i
-
-The k scores are stacked and softmaxed. k therefore appears only in how many rows
-we stack, never in a weight shape, so the label set can change per request.
+  * noul, choice, score: the row is softmaxed, so exactly one option wins.
+  * multi: each score goes through its own sigmoid, so any number can be true.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel
+from torch import nn
+from transformers import AutoModel, AutoTokenizer
+from transformers import BertConfig, BertModel
 
-DEFAULT_BASE_MODEL = "answerdotai/ModernBERT-large"
+from .config import OpenJevConfig
+from .data import CHOICE, MULTI, TYPES
 
-
-@dataclass
-class OpenJevOutput:
-    loss: torch.Tensor | None
-    logits: torch.Tensor          # (num_questions, max_k) padded with -inf
-    log_probs: torch.Tensor       # (num_questions, max_k) padded with -inf
-    temperature: torch.Tensor
+HEAD_NAME = "head.pt"
+ENCODER_DIR = "encoder"
 
 
 class OpenJevModel(nn.Module):
-    """Encoder + scalar decision head + a learned calibration temperature."""
-
-    def __init__(
-        self,
-        base_model: str = DEFAULT_BASE_MODEL,
-        pooling: str = "cls",
-        head_dropout: float = 0.1,
-        gradient_checkpointing: bool = False,
-    ) -> None:
+    def __init__(self, config: OpenJevConfig, encoder: nn.Module | None = None):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(base_model)
-        self.encoder = AutoModel.from_pretrained(base_model)
-        if gradient_checkpointing:
-            self.encoder.gradient_checkpointing_enable()
-
-        hidden = self.config.hidden_size
-        self.pooling = pooling
-
-        # The entire open-label trick: ONE output unit, reused for every option.
-        self.head = nn.Sequential(
-            nn.Dropout(head_dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(head_dropout),
-            nn.Linear(hidden, 1),
-        )
-
-        # Calibration temperature, stored in log space to keep it positive.
-        # Fitted on held-out data after the main run; frozen during training.
-        self.log_temperature = nn.Parameter(torch.zeros(1), requires_grad=False)
-
-        self._init_head()
-
-    def _init_head(self) -> None:
-        for module in self.head.modules():
-            if isinstance(module, nn.Linear):
-                module.weight.data.normal_(mean=0.0, std=0.02)
-                if module.bias is not None:
-                    module.bias.data.zero_()
+        self.config = config
+        self.encoder = encoder if encoder is not None else AutoModel.from_pretrained(config.encoder)
+        hidden = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(config.dropout)
+        # noul and choice. A softmax ignores a constant shift, so this head
+        # never learns an absolute level; that is fine for picking one option.
+        self.head = nn.Linear(hidden, 1)
+        # multi. A sigmoid needs an absolute level (0.5 must mean something),
+        # so it gets its own head instead of reusing the shift-free one.
+        self.multi_head = nn.Linear(hidden, 1)
+        # One temperature per question type, indexed like TYPES. Fitted after
+        # training on held-out data; 1.0 means uncalibrated.
+        self.register_buffer("temperature", torch.ones(len(TYPES)))
 
     @property
-    def temperature(self) -> torch.Tensor:
-        return self.log_temperature.exp()
+    def device(self) -> torch.device:
+        # transformers.Pipeline reads model.device, which plain nn.Modules lack.
+        return self.temperature.device
 
-    def _pool(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        if self.pooling == "cls":
-            return hidden_states[:, 0]
-        # Mean pooling over real tokens only; padding must not dilute the vector.
-        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
-        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+    def score_candidates(self, input_ids, attention_mask, token_type_ids=None,
+                         multi: torch.Tensor | None = None) -> torch.Tensor:
+        """One scalar score per (state, option) pair. Shape (N,).
 
-    def score_candidates(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score a flat batch of (state, option) pairs. Returns (num_pairs,)."""
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self._pool(out.last_hidden_state, attention_mask)
-        return self.head(pooled).squeeze(-1)
+        `multi` is a bool per pair; those pairs are scored by `multi_head`.
+        """
+        kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+        if token_type_ids is not None:
+            kwargs["token_type_ids"] = token_type_ids
+        hidden = self.encoder(**kwargs).last_hidden_state
+        if self.config.pooling == "mean":
+            mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        else:
+            pooled = hidden[:, 0]
+        pooled = self.dropout(pooled)
+        scores = self.head(pooled).squeeze(-1)
+        if multi is not None and multi.any():
+            scores = torch.where(multi, self.multi_head(pooled).squeeze(-1), scores)
+        return scores
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,        # (num_pairs, seq_len) — options flattened
-        attention_mask: torch.Tensor,
-        group_index: torch.Tensor,      # (num_pairs,) which question each pair belongs to
-        option_index: torch.Tensor,     # (num_pairs,) position within that question
-        num_questions: int,
-        max_k: int,
-        labels: torch.Tensor | None = None,        # (num_questions,) gold option index
-        target_dist: torch.Tensor | None = None,   # (num_questions, max_k) soft targets
-        apply_temperature: bool = False,
-    ) -> OpenJevOutput:
-        scores = self.score_candidates(input_ids, attention_mask)
+    def forward(self, input_ids, attention_mask, group_index, option_index, num_groups,
+                max_options, token_type_ids=None, kinds=None) -> torch.Tensor:
+        """Raw logits of shape (num_groups, max_options); padding slots are -inf.
 
-        # Scatter the flat scores back into a (num_questions, max_k) grid. Slots
-        # for options a question doesn't have stay at -inf so softmax ignores them
-        # — this is what lets one batch hold a k=2 noul and a k=17 choice.
-        logits = scores.new_full((num_questions, max_k), float("-inf"))
-        logits[group_index, option_index] = scores
+        `kinds` holds each group's index into TYPES; omitted means all choice.
+        """
+        multi = None if kinds is None else (kinds == MULTI)[group_index]
+        scores = self.score_candidates(input_ids, attention_mask, token_type_ids, multi).float()
+        logits = scores.new_full((num_groups, max_options), float("-inf"))
+        return logits.index_put((group_index, option_index), scores)
 
-        if apply_temperature:
-            logits = logits / self.temperature
+    # ---- persistence -------------------------------------------------------
 
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        loss = None
-        if target_dist is not None:
-            # Soft targets: KL(target || pred). Lets a label carry genuine
-            # uncertainty ("60% billing, 40% technical") instead of forcing a
-            # one-hot the model would have to be overconfident to fit.
-            valid = torch.isfinite(logits)
-            safe_log_probs = torch.where(valid, log_probs, torch.zeros_like(log_probs))
-            loss = -(target_dist * safe_log_probs).sum(dim=-1).mean()
-        elif labels is not None:
-            loss = F.nll_loss(log_probs, labels)
-
-        return OpenJevOutput(
-            loss=loss,
-            logits=logits,
-            log_probs=log_probs,
-            temperature=self.temperature.detach(),
+    def save_pretrained(self, directory: str, tokenizer=None) -> None:
+        os.makedirs(directory, exist_ok=True)
+        self.config.save(directory)
+        self.encoder.save_pretrained(os.path.join(directory, ENCODER_DIR))
+        if tokenizer is not None:
+            tokenizer.save_pretrained(os.path.join(directory, ENCODER_DIR))
+        torch.save(
+            {"head": self.head.state_dict(), "multi_head": self.multi_head.state_dict(),
+             "temperature": self.temperature.cpu()},
+            os.path.join(directory, HEAD_NAME),
         )
 
-    @torch.no_grad()
-    def set_temperature(self, value: float) -> None:
-        self.log_temperature.data = torch.tensor([value], device=self.log_temperature.device).log()
+    @classmethod
+    def from_pretrained(cls, directory: str) -> "OpenJevModel":
+        config = OpenJevConfig.load(directory)
+        encoder = AutoModel.from_pretrained(os.path.join(directory, ENCODER_DIR))
+        model = cls(config, encoder=encoder)
+        state = torch.load(os.path.join(directory, HEAD_NAME), map_location="cpu")
+        model.head.load_state_dict(state["head"])
+        if "multi_head" in state:  # older checkpoints were choice-only
+            model.multi_head.load_state_dict(state["multi_head"])
+        model.temperature.copy_(_per_type(state["temperature"]))
+        return model
+
+
+def _per_type(temperature: torch.Tensor) -> torch.Tensor:
+    """Temperatures from older checkpoints, stretched to one per current type.
+
+    Very old checkpoints stored one shared value; ones from before `score`
+    existed stored three. Types a checkpoint doesn't know reuse the choice
+    temperature, the closest calibrated softmax.
+    """
+    temperature = temperature.flatten().float()
+    if temperature.numel() == 1:
+        return temperature.expand(len(TYPES))
+    missing = len(TYPES) - temperature.numel()
+    return torch.cat([temperature, temperature[CHOICE].repeat(missing)])
+
+
+def load_tokenizer(config: OpenJevConfig, checkpoint_dir: str | None = None):
+    source = os.path.join(checkpoint_dir, ENCODER_DIR) if checkpoint_dir else config.encoder
+    return AutoTokenizer.from_pretrained(source)
+
+
+def masked_log_softmax(logits: torch.Tensor) -> torch.Tensor:
+    """log_softmax that returns 0 (not -inf) at padded slots."""
+    mask = torch.isfinite(logits)
+    return torch.log_softmax(logits, dim=-1).masked_fill(~mask, 0.0)
+
+
+def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy against a target distribution (KL up to a constant)."""
+    return -(targets * masked_log_softmax(logits)).sum(-1).mean()
+
+
+def openjev_loss(logits: torch.Tensor, targets: torch.Tensor,
+                 kinds: torch.Tensor | None = None) -> torch.Tensor:
+    """Mean over examples of each row's loss for its question type.
+
+    noul/choice/score rows: soft cross-entropy over the row.
+    multi rows: binary cross-entropy per option, averaged over real options.
+    """
+    ce = -(targets * masked_log_softmax(logits)).sum(-1)
+    if kinds is None or not (kinds == MULTI).any():
+        return ce.mean()
+    real = torch.isfinite(logits)
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits.masked_fill(~real, 0.0), targets, reduction="none")
+    bce = (bce * real).sum(-1) / real.sum(-1)
+    return torch.where(kinds == MULTI, bce, ce).mean()
+
+
+def probabilities(logits: torch.Tensor, kinds: torch.Tensor | None = None,
+                  temperature: torch.Tensor | None = None) -> torch.Tensor:
+    """Calibrated probabilities, same shape as `logits`; padding slots are 0.
+
+    noul/choice/score rows sum to 1. multi rows hold one independent P(selected) per option.
+    """
+    if kinds is None:
+        kinds = torch.full((logits.shape[0],), TYPES.index("choice"), device=logits.device)
+    if temperature is not None:
+        logits = logits / temperature.to(logits.device)[kinds].unsqueeze(-1)
+    real = torch.isfinite(logits)
+    softmax = masked_log_softmax(logits).exp() * real
+    sigmoid = torch.sigmoid(logits) * real
+    return torch.where((kinds == MULTI).unsqueeze(-1), sigmoid, softmax)
