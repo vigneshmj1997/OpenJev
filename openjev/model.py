@@ -1,3 +1,4 @@
+# TODO not completed
 """OpenJev: an encoder that scores each (state, option) pair.
 
 The head is `Linear(hidden, 1)` applied per option, not `Linear(hidden, k)`,

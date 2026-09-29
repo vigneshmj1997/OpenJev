@@ -1,3 +1,4 @@
+# TODO not completed
 """Two-stage training: fit the encoder + heads, then fit temperatures.
 
 Every epoch the model is scored on the calibration split to fit one
